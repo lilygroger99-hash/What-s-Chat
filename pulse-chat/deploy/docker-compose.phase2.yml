@@ -1,0 +1,48 @@
+# Phase 2 overlay — NOT used in Phase 1.
+#   docker compose -f docker-compose.yml -f docker-compose.phase2.yml up -d
+#
+# Adds object storage for media and a STUN/TURN relay for calls. Untested scaffolding:
+# review every value before exposing it to the internet.
+services:
+  minio:
+    image: minio/minio:latest   # pin a dated RELEASE tag before production
+    restart: unless-stopped
+    command: server /data --console-address "127.0.0.1:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ${DATA_DIR:-./data}/minio:/data   # or a dedicated Synology shared folder
+    networks: [internal]
+    mem_limit: 512m
+
+  # TURN must be reachable directly from the internet (UDP), so it uses host networking and
+  # CANNOT sit behind the DSM reverse proxy. Needs a router forward for:
+  #   3478 UDP+TCP, 5349 TCP (TLS), and the relay range below (UDP).
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - -n
+      - --log-file=stdout
+      - --realm=${TURN_REALM}
+      - --use-auth-secret                 # short-lived credentials minted by the backend (HMAC)
+      - --static-auth-secret=${TURN_SECRET}
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --min-port=49160                  # keep the relay range small: you forward each port
+      - --max-port=49200
+      - --fingerprint
+      - --no-multicast-peers
+      - --no-cli
+      # Never let a relay reach your LAN or NAS (SSRF-style pivot):
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --external-ip=${TURN_EXTERNAL_IP}
+      - --cert=/certs/fullchain.pem
+      - --pkey=/certs/privkey.pem
+    volumes:
+      - ${TURN_CERT_DIR:-./certs}:/certs:ro
