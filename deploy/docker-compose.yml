@@ -1,0 +1,107 @@
+# Pulse Chat — Synology Container Manager project.
+#
+# Request path:
+#   Internet :443 -> router -> DSM reverse proxy (TLS, Let's Encrypt) -> 127.0.0.1:8080
+#   -> nginx (this project: limits, WS upgrade) -> app:3000
+#
+# Only nginx publishes a host port, and only on loopback. Postgres/Redis/app are reachable
+# solely on the private compose network.
+
+name: pulse
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+services:
+  app:
+    build: { context: ../backend }
+    image: pulse-backend:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: postgres://pulse:${POSTGRES_PASSWORD}@db:5432/pulse
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    networks: [internal]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 768m
+    logging: *logging
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pulse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: pulse
+    command:
+      - postgres
+      - -c
+      - max_connections=60
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_timeout=15min
+      # Default (on) is the safe choice: an acknowledged message is on disk. Only change to
+      # 'off' if you accept losing the last ~600 ms of messages on power loss for more throughput.
+      - -c
+      - synchronous_commit=on
+    volumes:
+      - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pulse -d pulse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+    shm_size: 256mb
+    mem_limit: 1g
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Redis holds ephemeral state only (presence, rate limits, OTPs, pub/sub): no need to persist it.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [internal]
+    mem_limit: 320m
+    logging: *logging
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      app: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:${NGINX_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/proxy_params.inc:/etc/nginx/proxy_params.inc:ro
+    networks: [internal]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, NET_BIND_SERVICE]
+    mem_limit: 128m
+    logging: *logging
+
+networks:
+  internal:
+    driver: bridge
